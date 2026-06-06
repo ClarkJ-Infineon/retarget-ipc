@@ -1,16 +1,16 @@
 # retarget-ipc — Multi-Core Printf Relay
 
-Route `printf` output from one core to another via shared memory. Designed for PSOC Edge E84 dual-core applications where the application runs on CM33 but output is consumed on CM55 (via UART or display).
+Route `printf` output from one core to another via shared memory. Designed for PSOC Edge E84 dual-core applications. **Bidirectional** — either core can be the sender (HOST) or receiver (DEVICE).
 
 ## Architecture
 
 ```
-CM33_NS (HOST):  printf("hello")
+HOST core:  printf("hello")
     → _write()  [COMPONENT_RETARGET_IPC_HOST]
         → shared memory ring buffer (lock-free SPSC)
         → optional UART tee (local debugging)
 
-CM55 (DEVICE):
+DEVICE core:
     retarget_ipc_read()  [COMPONENT_RETARGET_IPC_DEVICE]
         → returns buffered data for local consumption
         → feed into retarget-io (UART) or retarget-lvgl (display)
@@ -18,13 +18,14 @@ CM55 (DEVICE):
 
 ## Use Cases
 
-| HOST output | DEVICE backend | Result |
-|---|---|---|
-| `retarget-ipc` | `retarget-io` | CM33 printf → CM55 UART |
-| `retarget-ipc` | `retarget-lvgl` | CM33 printf → CM55 display |
-| `retarget-ipc` | Custom | CM33 printf → anything on CM55 |
+| Direction | HOST (sender) | DEVICE (receiver) | Result |
+|---|---|---|---|
+| CM33→CM55 | CM33_NS | CM55 + retarget-lvgl | App printf → display |
+| CM33→CM55 | CM33_NS | CM55 + retarget-io | App printf → CM55 UART |
+| CM55→CM33 | CM55 | CM33_NS + retarget-io | App printf → CM33 UART |
+| CM55→CM33 | CM55 | CM33_NS + custom | App printf → any CM33 backend |
 
-## Quick Start
+## Quick Start — Direction 1: CM33 → CM55 (Display)
 
 ### 1. Add to Both Core Projects
 
@@ -73,14 +74,7 @@ int main(void)
     cybsp_init();
     __enable_irq();
 
-    /* Initialize IPC (sets up shared memory) */
     retarget_ipc_host_init();
-
-    /* Optional: UART tee for local serial output */
-    #ifdef RETARGET_IPC_UART_TEE
-    // ... init UART ...
-    retarget_ipc_host_set_uart(&my_uart);
-    #endif
 
     /* Now printf goes to shared memory → CM55 */
     printf("Hello from CM33!\n");
@@ -96,9 +90,7 @@ int main(void)
 void gfx_task(void *arg)
 {
     retarget_ipc_device_init();
-
     // ... LVGL init ...
-    // retarget-lvgl automatically calls retarget_ipc_read() if available
     retarget_lvgl_init(lv_screen_active());
 
     while (1) {
@@ -108,12 +100,47 @@ void gfx_task(void *arg)
 }
 ```
 
-**CM55 — Using with retarget-io (UART relay):**
+---
+
+## Quick Start — Direction 2: CM55 → CM33 (UART)
+
+For applications where the main logic runs on CM55 but UART is on CM33.
+
+### CM55 Makefile:
+```makefile
+COMPONENTS += RETARGET_IPC_HOST
+INCLUDES += $(SEARCH_retarget-ipc)/include
+# Remove retarget-io from CM55 (conflicts with _write)
+```
+
+### CM33_NS Makefile:
+```makefile
+COMPONENTS += RETARGET_IPC_DEVICE
+INCLUDES += $(SEARCH_retarget-ipc)/include
+# Keep retarget-io for CM33's own UART output (no conflict — DEVICE has no _write)
+```
+
+### CM55 `main.c`:
+```c
+#include "retarget_ipc.h"
+
+int main(void)
+{
+    cybsp_init();
+    __enable_irq();
+    retarget_ipc_host_init();
+
+    printf("Hello from CM55!\n");  /* → shared memory → CM33 UART */
+    vTaskStartScheduler();
+}
+```
+
+### CM33_NS `main.c` (relay task):
 ```c
 #include "retarget_ipc.h"
 #include "cy_retarget_io.h"
 
-void relay_task(void *arg)
+void ipc_relay_task(void *arg)
 {
     uint8_t buf[256];
     retarget_ipc_device_init();
@@ -121,7 +148,6 @@ void relay_task(void *arg)
     while (1) {
         uint32_t n = retarget_ipc_read(buf, sizeof(buf));
         if (n > 0) {
-            /* Send to UART via retarget-io's uart object */
             for (uint32_t i = 0; i < n; i++) {
                 cyhal_uart_putc(&cy_retarget_io_uart_obj, buf[i]);
             }
@@ -131,16 +157,18 @@ void relay_task(void *arg)
 }
 ```
 
+---
+
 ## API Reference
 
 ### HOST Side (COMPONENT_RETARGET_IPC_HOST)
 
 | Function | Description |
 |----------|-------------|
-| `retarget_ipc_host_init()` | Initialize shared memory buffer. Call in `main()` before scheduler. |
+| `retarget_ipc_host_init()` | Initialize shared memory buffer. Call before scheduler. |
 | `retarget_ipc_host_set_uart(uart)` | Enable UART tee (requires `RETARGET_IPC_UART_TEE` define) |
 
-The library also provides a strong `_write()` that captures all printf output.
+The library provides a strong `_write()` that captures all printf output.
 
 ### DEVICE Side (COMPONENT_RETARGET_IPC_DEVICE)
 
@@ -148,7 +176,7 @@ The library also provides a strong `_write()` that captures all printf output.
 |----------|-------------|
 | `retarget_ipc_device_init()` | Prepare receiver. Call before reading. |
 | `retarget_ipc_read(buf, max_len)` | Read available data. Non-blocking, returns 0 if empty. |
-| `retarget_ipc_is_active()` | Check if host has initialized the channel. |
+| `retarget_ipc_is_active()` | Check if HOST has initialized the channel. |
 | `retarget_ipc_get_dropped()` | Get and clear dropped byte count. |
 
 ## Configuration
@@ -157,37 +185,40 @@ The library also provides a strong `_write()` that captures all printf output.
 |--------|---------|-------------|
 | `RETARGET_IPC_BUFFER_SIZE` | 4096 | Ring buffer size (power of 2) |
 | `RETARGET_IPC_SHARED_ADDR` | `0x261FE000` | Shared memory address |
-| `RETARGET_IPC_UART_TEE` | (not defined) | Enable UART passthrough on host |
+| `RETARGET_IPC_UART_TEE` | (not defined) | Enable UART passthrough on HOST |
+
+## How It Works
+
+The shared memory ring buffer uses a **lock-free Single-Producer Single-Consumer (SPSC)** design:
+- Only the HOST writes `head` / Only the DEVICE writes `tail`
+- ARM `DMB` (Data Memory Barrier) instructions ensure cross-core visibility
+- FreeRTOS critical sections protect HOST writes from concurrent tasks
+- No mutex needed between cores — safe without inter-core synchronization
+- Non-blocking: if buffer is full, HOST drops bytes and increments `dropped` counter
 
 ## Memory Requirements
 
 | Resource | Size | Location |
 |----------|------|----------|
 | Shared ring buffer struct | ~4.1 KB | Shared SOCMEM (non-cacheable) |
-| Host code | ~400 bytes | CM33_NS Flash |
-| Device code | ~300 bytes | CM55 Flash |
+| Host code | ~500 bytes | HOST core Flash |
+| Device code | ~400 bytes | DEVICE core Flash |
 
 ## Prerequisites
 
 - PSOC Edge E84 dual-core project (CM33 + CM55)
-- Shared memory region accessible by both cores (default BSP provides this)
-- FreeRTOS on at least one core (for task scheduling)
+- Shared memory region accessible by both cores (non-cacheable)
+- FreeRTOS on HOST core (for critical sections in `_write()`)
 - `retarget-io` must be **removed** from the HOST core project (conflicting `_write()`)
-
-## How It Works
-
-The shared memory ring buffer uses a **lock-free Single-Producer Single-Consumer (SPSC)** design:
-- Only the HOST writes `head` / Only the DEVICE writes `tail`
-- ARM `DMB` (Data Memory Barrier) instructions ensure ordering
-- No mutex needed — safe across cores without synchronization primitives
-- Non-blocking: if buffer is full, HOST drops bytes and increments `dropped` counter
+- `retarget-io` **may remain** on the DEVICE core (no conflict)
 
 ## Supported Platforms
 
-| Platform | HOST Core | DEVICE Core | Status |
-|----------|-----------|-------------|--------|
-| PSOC Edge E84 | CM33_NS | CM55 | ✅ Primary target |
-| PSOC Edge E84 | CM33_S | CM55 | Should work |
+| Platform | Direction | Status |
+|----------|-----------|--------|
+| PSOC Edge E84 | CM33_NS → CM55 | ✅ Primary target |
+| PSOC Edge E84 | CM55 → CM33_NS | ✅ Supported |
+| PSOC Edge E84 | CM33_S → CM55 | Should work |
 
 ## License
 
