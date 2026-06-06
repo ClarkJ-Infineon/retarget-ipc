@@ -212,6 +212,8 @@ The shared memory ring buffer uses a **lock-free Single-Producer Single-Consumer
 - `retarget-io` must be **removed** from the HOST core project (conflicting `_write()`)
 - `retarget-io` **may remain** on the DEVICE core (no conflict)
 
+> **Note:** Without `retarget-io`, newlib defaults to line-buffered stdout. If your application uses `printf` without trailing newlines (e.g., ANSI escapes, progress indicators), add `setvbuf(stdout, NULL, _IONBF, 0)` early in `main()` to ensure immediate flushing. When paired with `retarget-lvgl`, this is handled automatically by `retarget_lvgl_init()`.
+
 ## Supported Platforms
 
 | Platform | Direction | Status |
