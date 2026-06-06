@@ -26,6 +26,7 @@
 #include "retarget_ipc.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include <stddef.h>
 #include <string.h>
 
 /* ARM memory barrier intrinsics */

@@ -32,6 +32,7 @@
  ******************************************************************************/
 
 #include "retarget_ipc.h"
+#include <stddef.h>
 
 /* ARM memory barrier intrinsics */
 #ifndef __DMB
